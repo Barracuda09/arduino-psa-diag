@@ -91,6 +91,7 @@
 | 2349 | Overspeed alert |
 | 234A | 2 Multiplexed front power windows |
 | 234B | 4 Multiplexed power windows |
+| 234C | Driver Welcome |
 | 234D | Powered rearview mirrors |
 | 2350 | Vehicle type (Silhouette) |
 | 2351 | Child safety type |
