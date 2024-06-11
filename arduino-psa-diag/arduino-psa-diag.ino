@@ -26,6 +26,7 @@ all copies or substantial portions of the Software.
 #include <mcp2515.h> // https://github.com/autowp/arduino-mcp2515 + https://github.com/watterott/Arduino-Libs/tree/master/digitalWriteFast
 #include <Thread.h> // https://github.com/ivanseidel/ArduinoThread slightly modified to unprotect runned() function
 #include <ThreadController.h>
+#include <stdint.h>
 
 /////////////////////
 //  Configuration  //
@@ -53,7 +54,8 @@ MCP2515 CAN0(CS_PIN_CAN0); // CAN-BUS Shield
 
 // My variables
 bool Dump = false; // Passive dump mode, dump Diagbox frames
-
+bool Echo = false;
+bool SendSeed = true;
 char tmp[4];
 
 int CAN_EMIT_ID = 0x752; // BSI
@@ -103,6 +105,7 @@ Thread sendAdditionalDiagFramesThread = Thread();
 
 void setup() {
   Serial.begin(SERIAL_SPEED);
+  Serial.dtr();
 
   CAN0.reset();
   CAN0.setBitrate(CAN_SPEED, CAN_FREQ);
@@ -136,20 +139,22 @@ void setup() {
 }
 
 /* https://github.com/ludwig-v/psa-seedkey-algorithm */
-long transform(byte data_msb, byte data_lsb, byte sec[]) {
-  long data = (data_msb << 8) | data_lsb;
-  long result = ((data % sec[0]) * sec[2]) - ((data / sec[0]) * sec[1]);
-  if (result < 0)
+int16_t transform(const uint8_t data_msb, const uint8_t data_lsb, const uint8_t sec[]) {
+  const int16_t data = (data_msb << 8) | data_lsb;
+  int32_t result = ((data % sec[0]) * sec[2]) - ((data / sec[0]) * sec[1]);
+  if (result < 0) {
     result += (sec[0] * sec[2]) + sec[1];
+  }
   return result;
 }
 
-unsigned long compute_response(unsigned short pin, unsigned long chg) {
-  byte sec_1[3] = {0xB2,0x3F,0xAA};
-  byte sec_2[3] = {0xB1,0x02,0xAB};
-
-  long res_msb = transform((pin >> 8), (pin & 0xFF), sec_1) | transform(((chg >> 24) & 0xFF), (chg & 0xFF), sec_2);
-  long res_lsb = transform(((chg >> 16) & 0xFF), ((chg >> 8) & 0xFF), sec_1) | transform((res_msb >> 8), (res_msb & 0xFF), sec_2);
+uint32_t compute_response(const uint16_t pin, const uint32_t chg) {
+  const uint8_t sec_1[3] = {0xB2, 0x3F, 0xAA};
+  const uint8_t sec_2[3] = {0xB1, 0x02, 0xAB};
+  int16_t res_msb = transform((pin >> 8), (pin & 0xFF), sec_1) |
+                    transform(((chg >> 24) & 0xFF), (chg & 0xFF), sec_2);
+  int16_t res_lsb = transform(((chg >> 16) & 0xFF), ((chg >> 8) & 0xFF), sec_1) |
+                    transform(res_msb >> 8, (res_msb & 0xFF), sec_2);
   return (res_msb << 16) | res_lsb;
 }
 
@@ -397,7 +402,6 @@ void sendDiagFrame(char * data, int frameFullLen, bool Raw) {
   int frameLen = 0;
   byte tmpFrame[8] = {0,0,0,0,0,0,0,0};
   struct can_frame diagFrame;
-
   for (i = 0; i < frameFullLen && i < 16; i += 2) {
     if (isxdigit(data[i]) && isxdigit(data[i + 1])) {
       tmpFrame[frameLen] = ahex2int(data[i], data[(i + 1)]);
@@ -544,13 +548,17 @@ void recvWithTimeout() {
   lastCharMillis = millis();
   while (Serial.available() > 0) {
     rc = Serial.read();
-
+    if (Echo) {
+      Serial.write(rc);
+    }
     receiveDiagFrameData[pos] = rc;
     receiveDiagFrameRead = pos;
 
-    if (millis() - lastCharMillis >= 1000 || rc == '\n' || pos >= MAX_DATA_LENGTH) {
+    if (millis() - lastCharMillis >= 1000 || rc == '\n' || rc == '\r' || pos >= MAX_DATA_LENGTH) {
+      if (Echo) {
+        Serial.write("\n");
+      }
       receiveDiagFrameData[pos] = '\0';
-
       if (receiveDiagFrameData[0] == '>') { // IDs Pair changing
         pos = 0;
         char * ids = strtok(receiveDiagFrameData + 1, ":");
@@ -584,15 +592,13 @@ void recvWithTimeout() {
           pos++;
           ids = strtok(NULL, ":");
         }
-        snprintf(tmp, 3, "%02X", UnlockService);
-
-        strcpy(UnlockCMD, "27");
-        strcat(UnlockCMD, tmp);
-
-        char diagCMD[5] = "10";
-        snprintf(tmp, 3, "%02X", DiagSess);
-        strcat(diagCMD, tmp);
+        snprintf(UnlockCMD, sizeof(UnlockCMD), "27%02X", UnlockService);
+/*
+        snprintf(diagCMD, sizeof(diagCMD), "10%02X", DiagSess);
         sendDiagFrame(diagCMD, strlen(diagCMD), false);
+*/
+        sendDiagFrame(UnlockCMD, strlen(UnlockCMD), false);
+        lastCMDSent = millis();
 
         if (DiagSess == 0xC0) { // KWP
           sendKeepAliveType = 'K';
@@ -600,7 +606,6 @@ void recvWithTimeout() {
           sendKeepAliveType = 'U';
         }
         sendKeepAlives = true;
-
         waitingUnlock = true;
       } else if (receiveDiagFrameData[0] == 'V') {
         Serial.println(SketchVersion);
@@ -616,9 +621,17 @@ void recvWithTimeout() {
         Serial.println("OK");
       } else if (receiveDiagFrameData[0] == 'N') {
         Dump = false;
+        Echo = false;
+        SendSeed = true;
         Serial.println("OK");
       } else if (receiveDiagFrameData[0] == 'X') {
         Dump = true;
+        Serial.println("OK");
+      } else if (receiveDiagFrameData[0] == 'E') {
+        Echo = true;
+        Serial.println("OK");
+      } else if (receiveDiagFrameData[0] == 'D') {
+        SendSeed = false;
         Serial.println("OK");
       } else if (receiveDiagFrameData[0] == 'K') {
         sendKeepAlives = true;
@@ -851,34 +864,24 @@ void parseCAN() {
         }
 
         if (waitingUnlock && canMsgRcvBuffer[t].data[0] < 0x10 && canMsgRcvBuffer[t].data[1] == 0x67 && canMsgRcvBuffer[t].data[2] == UnlockService) {
-          char SeedKey[9];
           char UnlockCMD_Seed[16];
 
-          snprintf(tmp, 3, "%02X", canMsgRcvBuffer[t].data[3]);
-          strcpy(SeedKey, tmp);
-          snprintf(tmp, 3, "%02X", canMsgRcvBuffer[t].data[4]);
-          strcat(SeedKey, tmp);
-          snprintf(tmp, 3, "%02X", canMsgRcvBuffer[t].data[5]);
-          strcat(SeedKey, tmp);
-          snprintf(tmp, 3, "%02X", canMsgRcvBuffer[t].data[6]);
-          strcat(SeedKey, tmp);
-          unsigned long Key = compute_response(UnlockKey, strtoul(SeedKey, NULL, 16));
-          snprintf(SeedKey, 9, "%08lX", Key);
+          const uint32_t chg = canMsgRcvBuffer[t].data[3] << 24 | canMsgRcvBuffer[t].data[4] << 16 |
+                               canMsgRcvBuffer[t].data[5] <<  8 | canMsgRcvBuffer[t].data[6];
 
-          strcpy(UnlockCMD_Seed, "27");
-          snprintf(tmp, 3, "%02X", (UnlockService + 1)); // Answer
-          strcat(UnlockCMD_Seed, tmp);
-          strcat(UnlockCMD_Seed, SeedKey);
+          const uint32_t Key = compute_response(UnlockKey, chg);
+          // Answer
+          snprintf(UnlockCMD_Seed, sizeof(UnlockCMD_Seed), "27%02X%08lX", (UnlockService + 1), Key);
 
-          if (Dump) {
+          if (Dump || Echo) {
             snprintf(tmp, 4, "%02X", CAN_EMIT_ID);
             Serial.print(tmp);
             Serial.print(":");
             Serial.println(UnlockCMD_Seed);
           }
-
-          sendDiagFrame(UnlockCMD_Seed, strlen(UnlockCMD_Seed), false);
-
+          if (SendSeed) {
+            sendDiagFrame(UnlockCMD_Seed, strlen(UnlockCMD_Seed), false);
+          }
           waitingUnlock = false;
         }
 
